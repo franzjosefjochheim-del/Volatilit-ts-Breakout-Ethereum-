@@ -2,392 +2,384 @@
 # -*- coding: utf-8 -*-
 
 """
-ETH Volatility Breakout (Donchian + ATR) – live/paper mit ccxt
-- Timeframe: 1h
-- Breakout über 24h-Range mit ATR-Puffer
-- Volatilitätsfilter, Trendfilter (EMA200)
-- Positionsgröße & Stop auf ATR-Basis
-- Teilgewinn bei +2R, Rest per Chandelier (3*ATR)
-- Zeit-Exit nach 48h ohne +1R
-- 1 Position gleichzeitig (kein Pyramiding)
+Ethereum Volatility Breakout Bot
+- Donchian-Kanal (obere/untere 24-Periode) + ATR-Puffer
+- Trendfilter: EMA200 (nur Longs oberhalb EMA200)
+- 1 Position max, Trailing Stop nach Chandelier (3*ATR), Zeit-Exit nach 48h
+- Timeframe per ENV (TIMEFRAME), z.B. 15m / 1h / 4h / 1d
+- PAPER=true (Default) => nur Logs, keine echten Orders
+- Exchanges via ccxt (nutze z.B. 'kraken', 'bybit', 'coinbase', 'binanceus' – Binance global ist in vielen Regionen gesperrt)
 """
 
 import os
+import sys
 import time
-import json
 import math
-import datetime as dt
-from typing import Optional, Dict, Any, Tuple
+import argparse
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
 import ccxt
 
-# ------------------------ Konfiguration aus ENV ------------------------
-EXCHANGE_NAME = os.getenv("EXCHANGE", "binance").lower()
-SYMBOL        = os.getenv("SYMBOL", "ETH/USDT")
-RISK_PCT      = float(os.getenv("RISK_PCT", "0.75"))           # % vom Equity pro Trade
-LONG_ONLY     = os.getenv("LONG_ONLY", "0") == "1"
-PAPER         = os.getenv("PAPER", "1") == "1"
 
-TIMEFRAME     = "1h"
-DONCHIAN_N    = 24
-ATR_N         = 14
-ATR_ENTRY_K   = 0.2     # Puffer * ATR
-ATR_STOP_K    = 1.5
-ATR_TRAIL_K   = 3.0
-VOL_FILTER    = 0.01    # ATR/Close >= 1%
-EMA_N         = 200
-PARTIAL_R     = 2.0     # 50% raus bei 2R
-TIME_EXIT_H   = 48
-LOOP_SEC      = 60
+# =========================
+# -------- ENV ------------
+# =========================
 
-STATE_FILE    = "eth_breakout_state.json"  # einfacher lokaler State
+EXCHANGE_ID = os.getenv("EXCHANGE", "kraken").strip().lower()
+SYMBOL = os.getenv("SYMBOL", "ETH/USDT").strip().upper()
 
-# ------------------------ Utils ------------------------
+# Timeframe aus ENV (Fallback 1h); harte Whitelist zur Sicherheit:
+TIMEFRAME = os.getenv("TIMEFRAME", "1h").strip().lower()
+_ALLOWED_TF = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","12h","1d"}
+if TIMEFRAME not in _ALLOWED_TF:
+    print(f"[WARN] Ungültiges TIMEFRAME='{TIMEFRAME}'. Erlaubt: {_ALLOWED_TF}. Fallback auf '1h'.")
+    TIMEFRAME = "1h"
 
-def utcnow() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
+RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))  # 1% vom verfügbaren Kapital
+LONG_ONLY = os.getenv("LONG_ONLY", "true").strip().lower() == "true"
+PAPER = os.getenv("PAPER", "true").strip().lower() == "true"
 
-def load_state() -> Dict[str, Any]:
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {
-        "position": None,   # {"side":"long/short","entry":float,"size":float,"stop":float,"risk_per_unit":float,"t_entry":iso,"tp_half_done":bool}
-        "last_bar_time": None
+API_KEY = os.getenv("API_KEY", "").strip()
+API_SECRET = os.getenv("API_SECRET", "").strip()
+
+# Strategie-Parameter (können bei Bedarf ebenfalls per ENV steuerbar gemacht werden)
+EMA_N = int(os.getenv("EMA_N", "200"))
+DONCHIAN_N = int(os.getenv("DONCHIAN_N", "24"))
+ATR_N = int(os.getenv("ATR_N", "14"))
+ATR_BUFFER = float(os.getenv("ATR_BUFFER", "0.5"))  # 0.5 * ATR Zusatzpuffer auf Breakout
+TRAIL_MULT = float(os.getenv("TRAIL_MULT", "3.0"))  # Chandelier-Stop: 3*ATR
+MAX_POSITIONS = 1
+TIME_EXIT_HOURS = int(os.getenv("TIME_EXIT_HOURS", "48"))
+
+# Loop-Intervall: kurze Wartezeit, wir handeln auf fertige Kerzen (Polling)
+LOOP_SLEEP_SEC = int(os.getenv("LOOP_SLEEP_SEC", "60"))
+
+
+# =========================
+# ----- Utilities ----------
+# =========================
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def tf_to_minutes(tf: str) -> int:
+    mapping = {
+        "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720,
+        "1d": 1440,
     }
+    return mapping[tf]
 
-def save_state(state: Dict[str, Any]) -> None:
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
+def print_header():
+    print(
+        f"[BOT] Exchange={EXCHANGE_ID} • Symbol={SYMBOL} • TF={TIMEFRAME} "
+        f"• PAPER={PAPER} • RISK_PCT={RISK_PCT:.2%} • LONG_ONLY={LONG_ONLY}"
+    )
 
-def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    hl  = df["high"] - df["low"]
-    hc  = (df["high"] - df["close"].shift()).abs()
-    lc  = (df["low"]  - df["close"].shift()).abs()
-    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(n).mean()
+# =========================
+# ---- Exchange-Init ------
+# =========================
+
+def init_exchange() -> ccxt.Exchange:
+    kwargs: Dict[str, Any] = {
+        "enableRateLimit": True,
+        "timeout": 30000,
+    }
+    if API_KEY and API_SECRET:
+        kwargs["apiKey"] = API_KEY
+        kwargs["secret"] = API_SECRET
+
+    if not hasattr(ccxt, EXCHANGE_ID):
+        raise RuntimeError(f"Unbekannte Exchange '{EXCHANGE_ID}'. Prüfe ccxt Doku.")
+
+    ex: ccxt.Exchange = getattr(ccxt, EXCHANGE_ID)(kwargs)
+
+    # Für einige Börsen sinnvolle Defaults:
+    # (keine harten Anforderungen – ccxt übernimmt viel)
+    ex.options = ex.options or {}
+    return ex
+
+# =========================
+# ---- Daten & Indikatoren
+# =========================
+
+def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 600) -> pd.DataFrame:
+    """Holt OHLCV und liefert DataFrame mit UTC-Timestamps und Spalten [t,o,h,l,c,v]."""
+    raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    if not raw:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw, columns=["mts", "o", "h", "l", "c", "v"])
+    df["t"] = pd.to_datetime(df["mts"], unit="ms", utc=True)
+    df = df[["t", "o", "h", "l", "c", "v"]].sort_values("t").reset_index(drop=True)
+    return df
 
 def ema(series: pd.Series, n: int) -> pd.Series:
     return series.ewm(span=n, adjust=False).mean()
 
-def get_exchange() -> ccxt.Exchange:
-    klass = getattr(ccxt, EXCHANGE_NAME)
-    kwargs = {"enableRateLimit": True}
-    if not PAPER:
-        api_key = os.getenv("API_KEY", "")
-        api_secret = os.getenv("API_SECRET", "")
-        if api_key and api_secret:
-            kwargs.update({"apiKey": api_key, "secret": api_secret})
-        # ggf. weitere Felder: password, uid etc. je nach Börse
-    ex = klass(kwargs)
-    # für einige Börsen Testnet konfigurieren (optional, hier generisch ausgelassen)
-    return ex
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    high = df["h"]
+    low = df["l"]
+    close = df["c"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(n).mean()
 
-def fetch_ohlcv_df(ex: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
-    raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    return df
+def donchian(df: pd.DataFrame, n: int = 20):
+    upper = df["h"].rolling(n).max()
+    lower = df["l"].rolling(n).min()
+    return upper, lower
 
-def can_trade_now(df: pd.DataFrame) -> Tuple[bool, Optional[pd.Timestamp]]:
-    """Nur auf bar-close reagieren. Gibt True zurück, wenn neue geschlossene Bar existiert."""
-    if df.empty:
-        return False, None
-    last = df["timestamp"].iloc[-1]
-    # Bei ccxt ist letzte Zeile die aktuell laufende Kerze ODER die letzte geschlossene – je nach Börse.
-    # Sicherer Ansatz: Wir handeln die VORLETZTE Zeile (die ist sicher geschlossen).
-    if len(df) < 2:
-        return False, None
-    closed_bar_time = df["timestamp"].iloc[-2]
-    return True, closed_bar_time
+# =========================
+# ---- Positions-State ----
+# =========================
 
-def price_precision(ex: ccxt.Exchange, symbol: str) -> Tuple[int, int]:
-    ex.load_markets()
-    m = ex.markets.get(symbol, {})
-    price_decimals = 6
-    amount_decimals = 6
-    if m:
-        price_decimals  = m.get("precision", {}).get("price", 6)
-        amount_decimals = m.get("precision", {}).get("amount", 6)
-    return price_decimals, amount_decimals
+class Position:
+    def __init__(self):
+        self.side: Optional[str] = None   # "long" / "short"
+        self.entry: Optional[float] = None
+        self.qty: float = 0.0
+        self.stop: Optional[float] = None
+        self.open_time: Optional[datetime] = None
+        self.highest_since_entry: Optional[float] = None
+        self.lowest_since_entry: Optional[float] = None
 
-def round_to(x: float, decimals: int) -> float:
-    if decimals >= 0:
-        p = 10.0**decimals
-        return math.floor(x * p) / p
-    return x
+    def reset(self):
+        self.__init__()
 
-# ------------------------ Handelslogik ------------------------
+STATE = {
+    "pos": Position()
+}
 
-def build_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["atr"] = atr(df, ATR_N)
-    df["ema200"] = ema(df["close"], EMA_N)
-    # Donchian über die letzten DONCHIAN_N Bars, exkl. aktueller Bar: shift(1)
-    df["donch_high"] = df["high"].rolling(DONCHIAN_N).max().shift(1)
-    df["donch_low"]  = df["low"].rolling(DONCHIAN_N).min().shift(1)
-    return df
+# =========================
+# ---- Order-Helfer --------
+# =========================
 
-def signal(df: pd.DataFrame, long_only: bool) -> Dict[str, Any]:
-    """Ermittelt Signal auf der letzten geschlossenen Bar (Index -2)."""
-    if len(df) < max(DONCHIAN_N + 2, ATR_N + 2, EMA_N + 2):
-        return {"action":"NONE"}
-    i = -2  # letzte abgeschlossene
-    row = df.iloc[i]
-    close = row["close"]
-    a = row["atr"]
-    ema200 = row["ema200"]
-    donch_high = row["donch_high"]
-    donch_low  = row["donch_low"]
+def get_quote_from_symbol(symbol: str) -> str:
+    # "ETH/USDT" -> "USDT"
+    if "/" in symbol:
+        return symbol.split("/")[1]
+    return symbol
 
-    if pd.isna(a) or pd.isna(ema200) or pd.isna(donch_high) or pd.isna(donch_low):
-        return {"action":"NONE"}
+def fetch_equity_quote(ex: ccxt.Exchange, symbol: str) -> float:
+    """Lädt verfügbares Quote-Wallet (z.B. USDT). Bei PAPER wird ein fester Wert angenommen."""
+    if PAPER or not API_KEY:
+        return 1000.0  # Paper-Einsatz
+    quote = get_quote_from_symbol(symbol)
+    bal = ex.fetch_balance()
+    return float(bal.get(quote, {}).get("free", 0.0))
 
-    # Volatilitätsfilter
-    if (a / close) < VOL_FILTER:
-        return {"action":"NONE"}
-
-    # Trendfilter + Breakout mit ATR-Puffer
-    up_break   = close > (donch_high + ATR_ENTRY_K * a)
-    down_break = close < (donch_low  - ATR_ENTRY_K * a)
-
-    # Optional: nur Long handeln
-    if long_only:
-        if up_break and close > ema200:
-            stop = close - ATR_STOP_K * a
-            return {"action":"LONG", "entry": close, "stop": stop, "atr": a}
-        return {"action":"NONE"}
-
-    # Long + Short
-    if up_break and close > ema200:
-        stop = close - ATR_STOP_K * a
-        return {"action":"LONG", "entry": close, "stop": stop, "atr": a}
-    if down_break and close < ema200:
-        stop = close + ATR_STOP_K * a
-        return {"action":"SHORT","entry": close, "stop": stop, "atr": a}
-
-    return {"action":"NONE"}
-
-def calc_position_size(equity_usd: float, entry: float, stop: float) -> float:
-    risk_usd = equity_usd * (RISK_PCT / 100.0)
-    per_unit_risk = abs(entry - stop)
-    if per_unit_risk <= 0:
-        return 0.0
-    size = risk_usd / per_unit_risk
-    return max(0.0, size)
-
-def current_equity_usd(ex: ccxt.Exchange) -> float:
-    """Für PAPER nehmen wir einen fiktiven Account mit 10.000 USD. Live: Free-Cash + Wert?"""
+def send_market_order(ex: ccxt.Exchange, symbol: str, side: str, qty: float) -> Optional[Dict[str, Any]]:
+    if qty <= 0:
+        return None
     if PAPER:
-        return 10000.0
-    # Minimalvariante (Spot): fiat-Saldo + ETH*Preis. Für echte Portfoliobewertung bitte ausbauen.
-    balances = ex.fetch_balance()
-    total_usdt = balances.get("total", {}).get("USDT", 0.0)
-    # ETH-Wert grob dazurechnen
-    ticker = ex.fetch_ticker(SYMBOL)
-    last   = float(ticker["last"])
-    total_eth = balances.get("total", {}).get("ETH", 0.0)
-    return float(total_usdt + total_eth * last)
+        print(f"[PAPER] {side.upper()} {qty:.6f} {symbol} (MARKET)")
+        return {"id": "paper-order", "symbol": symbol, "side": side, "amount": qty, "type": "market"}
 
-def place_order(ex: ccxt.Exchange, side: str, amount: float) -> Dict[str, Any]:
-    if PAPER:
-        return {"id":"paper-order", "status":"filled"}
     try:
-        ord = ex.create_order(SYMBOL, "market", side, amount)
-        return ord
+        order = ex.create_order(symbol, "market", side, qty)
+        print(f"[LIVE]  {side.upper()} {qty:.6f} {symbol} (MARKET) -> {order.get('id')}")
+        return order
     except Exception as e:
-        print(f"[ORDER] Fehler: {e}")
-        return {"id":"error", "status":"rejected", "error": str(e)}
+        print(f"[ERR] Order fehlgeschlagen: {e}")
+        return None
 
-def flatten_position(ex: ccxt.Exchange, pos: Dict[str, Any]) -> None:
-    if pos is None: 
-        return
-    side = pos["side"]
-    amount = pos["size"]
-    if amount <= 0:
-        return
-    exit_side = "sell" if side == "long" else "buy"
-    print(f"[EXIT] Schließe Position: {exit_side} {amount}")
-    _ = place_order(ex, exit_side, amount)
+# =========================
+# ---- Logik / Signale ----
+# =========================
 
-def manage_open_position(ex: ccxt.Exchange, df: pd.DataFrame, state: Dict[str, Any]) -> None:
-    """Regelt Trailing, Teilgewinn, Zeit-Exit auf Basis der letzten geschlossenen Bar."""
-    pos = state.get("position")
-    if not pos:
-        return
-    i = -2
-    row = df.iloc[i]
-    close = float(row["close"])
-    a = float(row["atr"])
-    entry = float(pos["entry"])
-    side  = pos["side"]
-    stop  = float(pos["stop"])
-    t_entry = dt.datetime.fromisoformat(pos["t_entry"])
-    r_per_unit = float(pos["risk_per_unit"])  # = abs(entry - initial_stop)
-    tp_half_done = bool(pos.get("tp_half_done", False))
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["ema"] = ema(df["c"], EMA_N)
+    df["atr"] = atr(df, ATR_N)
+    dc_up, dc_lo = donchian(df, DONCHIAN_N)
+    df["dc_up"] = dc_up
+    df["dc_lo"] = dc_lo
+    return df
 
-    # 1) Zeit-Exit nach TIME_EXIT_H
-    if (utcnow() - t_entry).total_seconds() >= TIME_EXIT_H * 3600:
-        if abs(close - entry) < r_per_unit:  # grobe Bedingung "kein +1R in TimeExit"
-            print("[TIME EXIT] Keine +1R innerhalb Zeitfenster -> Flat")
-            flatten_position(ex, pos)
-            state["position"] = None
-            save_state(state)
+def decide_and_trade(ex: ccxt.Exchange, df: pd.DataFrame):
+    """Kernlogik: Breakout + ATR-Puffer + EMA200-Filter. 1 Position max; Trailstop + Zeit-Exit."""
+    if df.empty or len(df) < max(EMA_N, DONCHIAN_N, ATR_N) + 2:
+        print("[BOT] Zu wenig Daten – warte …")
+        return
+
+    pos: Position = STATE["pos"]
+
+    # Wir verwenden IMMER die letzte ABGESCHLOSSENE Kerze
+    # -> index -2 (die letzte könnte noch unvollständig sein)
+    row = df.iloc[-2]
+    close = float(row["c"])
+    ema200 = float(row["ema"])
+    atr_val = float(row["atr"])
+    dc_up = float(row["dc_up"])
+    dc_lo = float(row["dc_lo"])
+
+    # Entry-Bedingungen (nur long, falls LONG_ONLY)
+    long_break = close > (dc_up + ATR_BUFFER * atr_val)
+    short_break = (not LONG_ONLY) and (close < (dc_lo - ATR_BUFFER * atr_val))
+
+    # --- Trailstop & Zeit-Exit, wenn Position offen ---
+    if pos.side is not None:
+        # Extremwerte seit Entry für Chandelier
+        if pos.side == "long":
+            pos.highest_since_entry = max(pos.highest_since_entry or close, close)
+            trail = pos.highest_since_entry - TRAIL_MULT * atr_val
+            if pos.stop is None:
+                pos.stop = trail
+            else:
+                pos.stop = max(pos.stop, trail)  # Stop nur nachziehen
+
+            # Zeit-Exit?
+            if pos.open_time and now_utc() - pos.open_time >= timedelta(hours=TIME_EXIT_HOURS):
+                print("[BOT] Zeit-Exit ausgelöst. Schließe LONG.")
+                qty_close = pos.qty
+                send_market_order(ex, SYMBOL, "sell", qty_close)
+                pos.reset()
+                return
+
+            # Stop ausgelöst?
+            if close <= (pos.stop or -1):
+                print(f"[BOT] Stop ausgelöst @ {pos.stop:.2f}. Schließe LONG.")
+                qty_close = pos.qty
+                send_market_order(ex, SYMBOL, "sell", qty_close)
+                pos.reset()
+                return
+
+        elif pos.side == "short":
+            pos.lowest_since_entry = min(pos.lowest_since_entry or close, close)
+            trail = pos.lowest_since_entry + TRAIL_MULT * atr_val
+            if pos.stop is None:
+                pos.stop = trail
+            else:
+                pos.stop = min(pos.stop, trail)
+            if pos.open_time and now_utc() - pos.open_time >= timedelta(hours=TIME_EXIT_HOURS):
+                print("[BOT] Zeit-Exit ausgelöst. Schließe SHORT.")
+                qty_close = pos.qty
+                send_market_order(ex, SYMBOL, "buy", qty_close)
+                pos.reset()
+                return
+            if close >= (pos.stop or 1e9):
+                print(f"[BOT] Stop ausgelöst @ {pos.stop:.2f}. Schließe SHORT.")
+                qty_close = pos.qty
+                send_market_order(ex, SYMBOL, "buy", qty_close)
+                pos.reset()
+                return
+
+        # Wenn Position offen ist, keine neuen Entries prüfen (nur 1 Position)
+        return
+
+    # --- Keine Position offen: neue Entry-Signale prüfen ---
+    # Trendfilter: nur Long wenn über EMA200, nur Short wenn unter EMA200
+    can_long = close > ema200
+    can_short = close < ema200 and (not LONG_ONLY)
+
+    # Positionsgröße: risikobasiert anhand ATR – sehr konservativ:
+    # Wir riskieren RISK_PCT des Quote-Kapitals mit Stop-Abstand ~ (TRAIL_MULT * ATR)
+    quote_capital = fetch_equity_quote(ex, SYMBOL)
+    risk_amount = max(0.0, quote_capital * RISK_PCT)
+    stop_distance = max(atr_val * TRAIL_MULT, 1e-6)
+    # Grobe Annäherung der Stückzahl:
+    qty_long = risk_amount / stop_distance
+
+    # Exchange-Minimumgrößen sind unterschiedlich – wir lassen es hier grob.
+    # Alternative: ex.markets[SYMBOL]['limits']['amount']['min'] berücksichtigen (wenn verfügbar).
+    qty_long = max(0.0, round(qty_long, 6))
+
+    if long_break and can_long and qty_long > 0:
+        print(f"[BOT] LONG-Signal • Close={close:.2f} > DonchianUp+ATRpuffer ({dc_up + ATR_BUFFER*atr_val:.2f}) • EMA200={ema200:.2f}")
+        order = send_market_order(ex, SYMBOL, "buy", qty_long)
+        if order:
+            STATE["pos"] = Position()
+            STATE["pos"].side = "long"
+            STATE["pos"].entry = close
+            STATE["pos"].qty = qty_long
+            STATE["pos"].open_time = now_utc()
+            STATE["pos"].highest_since_entry = close
+            STATE["pos"].stop = close - TRAIL_MULT * atr_val
+            print(f"[BOT] LONG eröffnet @ {close:.2f} • Qty={qty_long:.6f} • initialer Stop={STATE['pos'].stop:.2f}")
+        return
+
+    if short_break and can_short:
+        # Für Short analoge Stückzahl (bei Spot nicht immer verfügbar)
+        qty_short = qty_long
+        if qty_short <= 0:
             return
-
-    # 2) Teilgewinn bei +2R (50% schließen einmalig)
-    pnl_per_unit = (close - entry) if side == "long" else (entry - close)
-    R = pnl_per_unit / r_per_unit if r_per_unit > 0 else 0.0
-    if (not tp_half_done) and (R >= PARTIAL_R):
-        half = pos["size"] * 0.5
-        print(f"[TP 50%] Realisiere halbe Position bei ~{close}")
-        _ = place_order(ex, "sell" if side=="long" else "buy", half)
-        pos["size"] = pos["size"] - half
-        pos["tp_half_done"] = True
-        save_state(state)
-
-    # 3) Trailing-Stop (Chandelier: 3*ATR)
-    if side == "long":
-        trail = close - ATR_TRAIL_K * a
-        new_stop = max(stop, trail)  # Stop nur anheben
-        if new_stop != stop:
-            print(f"[TRAIL] Stop anheben: {stop:.2f} -> {new_stop:.2f}")
-            pos["stop"] = new_stop
-            save_state(state)
-        # Wenn close unter Stop -> aussteigen
-        if close <= pos["stop"]:
-            print(f"[STOP OUT] LONG @ {close:.2f} unter Stop {pos['stop']:.2f}")
-            flatten_position(ex, pos)
-            state["position"] = None
-            save_state(state)
-    else:
-        trail = close + ATR_TRAIL_K * a
-        new_stop = min(stop, trail)  # Stop nur senken (bei Short)
-        if new_stop != stop:
-            print(f"[TRAIL] Stop senken: {stop:.2f} -> {new_stop:.2f}")
-            pos["stop"] = new_stop
-            save_state(state)
-        if close >= pos["stop"]:
-            print(f"[STOP OUT] SHORT @ {close:.2f} über Stop {pos['stop']:.2f}")
-            flatten_position(ex, pos)
-            state["position"] = None
-            save_state(state)
-
-def try_new_entry(ex: ccxt.Exchange, df: pd.DataFrame, state: Dict[str, Any]) -> None:
-    if state.get("position"):
-        return  # kein Pyramiding
-    sig = signal(df, LONG_ONLY)
-    if sig["action"] == "NONE":
+        print(f"[BOT] SHORT-Signal • Close={close:.2f} < DonchianLo-ATRpuffer ({dc_lo - ATR_BUFFER*atr_val:.2f}) • EMA200={ema200:.2f}")
+        order = send_market_order(ex, SYMBOL, "sell", qty_short)
+        if order:
+            STATE["pos"] = Position()
+            STATE["pos"].side = "short"
+            STATE["pos"].entry = close
+            STATE["pos"].qty = qty_short
+            STATE["pos"].open_time = now_utc()
+            STATE["pos"].lowest_since_entry = close
+            STATE["pos"].stop = close + TRAIL_MULT * atr_val
+            print(f"[BOT] SHORT eröffnet @ {close:.2f} • Qty={qty_short:.6f} • initialer Stop={STATE['pos'].stop:.2f}")
         return
 
-    entry = float(sig["entry"])
-    stop  = float(sig["stop"])
-    a     = float(sig["atr"])
+    # Kein Signal:
+    print(
+        f"[BOT] Kein Entry • Close={close:.2f} • EMA200={ema200:.2f} • "
+        f"Up={dc_up:.2f} • Lo={dc_lo:.2f} • ATR={atr_val:.2f}"
+    )
 
-    # Spread/Plumps-Check (einfach)
-    ticker = ex.fetch_ticker(SYMBOL)
-    ask = float(ticker["ask"] or entry)
-    bid = float(ticker["bid"] or entry)
-    if ask <= 0 or bid <= 0:
-        return
-    spread = (ask - bid) / ((ask + bid) / 2.0)
-    if spread > 0.0005:  # > 5 bps -> nicht handeln
-        print(f"[SKIP] Spread zu groß: {spread:.5f}")
-        return
+# =========================
+# ---- Run-Wrapper --------
+# =========================
 
-    eq = current_equity_usd(ex)
-    size = calc_position_size(eq, entry, stop)
-    if size <= 0:
-        print("[SKIP] Größe=0")
-        return
+def trade_once(ex: ccxt.Exchange):
+    print(f"[BOT] Starte Runde • Exchange={EXCHANGE_ID} • TF={TIMEFRAME}")
+    try:
+        ex.load_markets()
+        df = fetch_ohlcv_df(ex, SYMBOL, TIMEFRAME, limit=max(EMA_N + 50, DONCHIAN_N + 50, ATR_N + 50))
+        if df.empty:
+            print("[BOT] Keine Daten vom Feed.")
+            return
+        df = compute_indicators(df)
+        decide_and_trade(ex, df)
+        print("[BOT] Runde fertig.")
+    except ccxt.base.errors.ExchangeNotAvailable as e:
+        print(f"[ERR] Exchange nicht verfügbar: {e}")
+    except Exception as e:
+        print(f"[ERR] Unerwarteter Fehler: {e}")
 
-    # Rundung nach Börsenpräzision
-    price_dec, amt_dec = price_precision(ex, SYMBOL)
-    size = round_to(size, amt_dec)
-    if size <= 0:
-        print("[SKIP] Größe nach Rundung=0")
-        return
-
-    side = "buy" if sig["action"] == "LONG" else "sell"
-    print(f"[ENTRY] {sig['action']} {size} @ ~{entry:.2f}, Stop {stop:.2f}, ATR {a:.2f}")
-    ord = place_order(ex, side, size)
-    if ord.get("status") == "rejected":
-        print("[ENTRY] Order abgelehnt")
-        return
-
-    # Position in State anlegen
-    state["position"] = {
-        "side": "long" if side == "buy" else "short",
-        "entry": entry,
-        "size": size,
-        "stop": stop,
-        "risk_per_unit": abs(entry - stop),
-        "t_entry": utcnow().isoformat(),
-        "tp_half_done": False
-    }
-    save_state(state)
-
-# ------------------------ Main Loop ------------------------
-
-def trade_once(ex: ccxt.Exchange, state: Dict[str, Any]) -> None:
-    df = fetch_ohlcv_df(ex, SYMBOL, TIMEFRAME, limit=max(EMA_N + 50, DONCHIAN_N + 50))
-    if df.empty:
-        print("[WARN] Keine Daten")
-        return
-
-    # Neue Bar prüfen
-    ok, closed_time = can_trade_now(df)
-    if not ok:
-        return
-    last_seen = state.get("last_bar_time")
-    if last_seen == (closed_time.isoformat() if closed_time else None):
-        # nichts neues
-        return
-
-    # Indikatoren
-    ind = build_indicators(df)
-
-    # Offene Position managen (Stop/Trail/TP/TimeExit) – immer auf Basis letzter geschlossener Bar
-    manage_open_position(ex, ind, state)
-
-    # Neuer Einstieg?
-    try_new_entry(ex, ind, state)
-
-    # Bar-Marker aktualisieren
-    state["last_bar_time"] = closed_time.isoformat()
-    save_state(state)
-
-def loop_forever():
-    print(f"[BOT] ETH Breakout gestartet – TF={TIMEFRAME} – PAPER={PAPER}")
-    ex = get_exchange()
-    state = load_state()
+def loop_forever(ex: ccxt.Exchange):
+    print_header()
     while True:
-        try:
-            trade_once(ex, state)
-        except Exception as e:
-            print(f"[ERR] {e}")
-        time.sleep(LOOP_SEC)
+        trade_once(ex)
+        time.sleep(LOOP_SLEEP_SEC)
 
-def run_once():
-    ex = get_exchange()
-    state = load_state()
-    trade_once(ex, state)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true", help="Eine Runde ausführen.")
+    parser.add_argument("--loop", action="store_true", help="Endlosschleife.")
+    args = parser.parse_args()
 
-if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--once", action="store_true", help="Eine Runde ausführen")
-    p.add_argument("--loop", action="store_true", help="Endlosschleife")
-    args = p.parse_args()
+    # Binance global ist oft regional gesperrt (HTTP 451). Nutze z.B. 'binanceus', 'kraken', 'bybit', 'coinbase'.
+    if EXCHANGE_ID == "binance":
+        print("[WARN] 'binance' ist in vielen Regionen gesperrt (HTTP 451). "
+              "Bitte stattdessen z.B. 'binanceus', 'kraken', 'bybit' oder 'coinbase' verwenden.")
+
+    ex = init_exchange()
 
     if args.once:
-        run_once()
-    else:
-        loop_forever()
+        print_header()
+        trade_once(ex)
+        return
+    if args.loop:
+        loop_forever(ex)
+        return
+
+    # Default: einmal ausführen
+    print_header()
+    trade_once(ex)
+
+
+if __name__ == "__main__":
+    main()
